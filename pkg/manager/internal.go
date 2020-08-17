@@ -232,6 +232,12 @@ func (cm *controllerManager) Add(r Runnable) error {
 	return nil
 }
 
+// set custom resource lock
+func (cm *controllerManager) SetResourceLock(rl resourcelock.Interface) error {
+	cm.resourceLock = rl
+	return nil
+}
+
 func (cm *controllerManager) SetFields(i interface{}) error {
 	if _, err := inject.ConfigInto(cm.config, i); err != nil {
 		return err
