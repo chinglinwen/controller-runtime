@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -32,12 +33,20 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+type typedNoop struct{}
+
+func (typedNoop) Reconcile(reconcile.Request) (reconcile.Result, error) {
+	return reconcile.Result{}, nil
+}
 
 var _ = Describe("application", func() {
 	var stop chan struct{}
@@ -149,6 +158,27 @@ var _ = Describe("application", func() {
 			Expect(instance).NotTo(BeNil())
 		})
 
+		It("should prefer reconciler from options during creation of controller", func() {
+			newController = func(name string, mgr manager.Manager, options controller.Options) (controller.Controller, error) {
+				if options.Reconciler != (typedNoop{}) {
+					return nil, fmt.Errorf("Custom reconciler expected %T but found %T", typedNoop{}, options.Reconciler)
+				}
+				return controller.New(name, mgr, options)
+			}
+
+			By("creating a controller manager")
+			m, err := manager.New(cfg, manager.Options{})
+			Expect(err).NotTo(HaveOccurred())
+
+			instance, err := ControllerManagedBy(m).
+				For(&appsv1.ReplicaSet{}).
+				Owns(&appsv1.ReplicaSet{}).
+				WithOptions(controller.Options{Reconciler: typedNoop{}}).
+				Build(noop)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(instance).NotTo(BeNil())
+		})
+
 		It("should allow multiple controllers for the same kind", func() {
 			By("creating a controller manager")
 			m, err := manager.New(cfg, manager.Options{})
@@ -203,6 +233,67 @@ var _ = Describe("application", func() {
 			close(done)
 		}, 10)
 	})
+
+	Describe("Set custom predicates", func() {
+		It("should execute registered predicates only for assigned kind", func(done Done) {
+			m, err := manager.New(cfg, manager.Options{})
+			Expect(err).NotTo(HaveOccurred())
+
+			var (
+				deployPrctExecuted     = false
+				replicaSetPrctExecuted = false
+				allPrctExecuted        = int64(0)
+			)
+
+			deployPrct := predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					defer GinkgoRecover()
+					// check that it was called only for deployment
+					Expect(e.Meta).To(BeAssignableToTypeOf(&appsv1.Deployment{}))
+					deployPrctExecuted = true
+					return true
+				},
+			}
+
+			replicaSetPrct := predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					defer GinkgoRecover()
+					// check that it was called only for replicaset
+					Expect(e.Meta).To(BeAssignableToTypeOf(&appsv1.ReplicaSet{}))
+					replicaSetPrctExecuted = true
+					return true
+				},
+			}
+
+			allPrct := predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					defer GinkgoRecover()
+					//check that it was called for all registered kinds
+					Expect(e.Meta).Should(Or(
+						BeAssignableToTypeOf(&appsv1.Deployment{}),
+						BeAssignableToTypeOf(&appsv1.ReplicaSet{}),
+					))
+
+					atomic.AddInt64(&allPrctExecuted, 1)
+					return true
+				},
+			}
+
+			bldr := ControllerManagedBy(m).
+				For(&appsv1.Deployment{}, WithPredicates(deployPrct)).
+				Owns(&appsv1.ReplicaSet{}, WithPredicates(replicaSetPrct)).
+				WithEventFilter(allPrct)
+
+			doReconcileTest("5", stop, bldr, m, true)
+
+			Expect(deployPrctExecuted).To(BeTrue(), "Deploy predicated should be called at least once")
+			Expect(replicaSetPrctExecuted).To(BeTrue(), "ReplicaSet predicated should be called at least once")
+			Expect(allPrctExecuted).To(BeNumerically(">=", 2), "Global Predicated should be called at least twice")
+
+			close(done)
+		})
+	})
+
 })
 
 func doReconcileTest(nameSuffix string, stop chan struct{}, blder *Builder, mgr manager.Manager, complete bool) {
